@@ -1,6 +1,10 @@
+import locale
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog
 import json
+
+import docx
 import openpyxl
 import openpyxl.styles
 from openpyxl.utils import get_column_letter
@@ -12,10 +16,20 @@ from docx.shared import Pt
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from tkinter import filedialog
 import pdfplumber
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 
 def pdf_convert(invoice_file,output_excel):
+    global annu_month # annual or monthly
     global money_type
+    with open(invoice_file) as f:
+        data1 = json.load(f)
+    for order_item in data1.get("orderItems", []):
+        start_date = order_item.get("startDate")
+        end_date = order_item.get("endDate")
+    if start_date is None: annu_month = "MONTHLY"
+    else: annu_month = f"{start_date[:10].replace('-', '.')} - {end_date[:10].replace('-', '.')}"
     if money_type == None: money_type = 'DOLLAR'
     def add_discounts_to_line(dict_line):
         for discount in dict_line['discounts']:
@@ -67,7 +81,8 @@ def pdf_convert(invoice_file,output_excel):
             'partnerDiscountTotal': 'Partner discount',
             'total': 'Total price for partner',
             'loyaltyDiscountTotal_percentage': 'Loyalty discount %',
-            'partnerDiscountTotal_percentage': 'Partner discount %'
+            'partnerDiscountTotal_percentage': 'Partner discount %',
+            'description': 'Full name'
         }
         renamed_dict = full_data
         for key in rename_matrix.keys():
@@ -81,7 +96,7 @@ def pdf_convert(invoice_file,output_excel):
         ordered_columns_to_keep = ['productName', 'unitPrice', 'loyaltyDiscountTotal', 'upgradeCredit',
                                    'priceAdjustment',
                                    'partnerDiscountTotal', 'total', 'loyaltyDiscountTotal_percentage',
-                                   'partnerDiscountTotal_percentage']
+                                   'partnerDiscountTotal_percentage', 'description']
         for line in invoice_data:
             new_line = do_calculations(line)
             line['productName'] = "{}, {} users".format(line['productName'], line['unitCount'])
@@ -216,15 +231,24 @@ def pdf_convert(invoice_file,output_excel):
     add_global_sheet_formatting(file_name=output_excel,
                                 header_size=header_lines,
                                 data_size=products_lines)
+    ## add new sheet
+    new_data = None
+    df_new = pd.DataFrame(new_data)
+    with pd.ExcelWriter(output_excel, engine='openpyxl', mode='a') as writer:
+        # Write the new DataFrame to a new sheet
+        df_new.to_excel(writer, sheet_name='New Sheet', index=False)
 
 
 def convert():
+    locale.setlocale(locale.LC_ALL, '')  # Use the default locale
+    global annu_month
     global selected_json_file
     global money_type
     if selected_json_file:
         output_folder = filedialog.askdirectory(title="Select Folder to Save File")
         if output_folder:
             print('converting...')
+            ##
             pdf_convert(selected_json_file, f'{output_folder}/excel_output.xlsx')
             excel_file = f'{output_folder}/excel_output.xlsx'
             df = pd.read_excel(excel_file, header=None)  # read the excel
@@ -234,7 +258,7 @@ def convert():
 
             company_name = ''
             table_dict = {}
-
+            after_discount = 0.0
             for index, row in enumerate(data_dict.values()):
                 for list_index, item in enumerate(row):
                     if item == 'Company name:' and index == 0:
@@ -245,6 +269,7 @@ def convert():
                             pass
                     else:
                         if index >= 5 and item != '':
+                            if list_index == 0 and row[6]!='': after_discount+=float(row[6])
                             if list_index == 0: table_dict[item] = row[list_index + 1]
 
             def find_total(table_dict):  # find total
@@ -262,9 +287,9 @@ def convert():
 
             # add total to table_dict
             table_dict['Total'] = total_of_dict
-            table_dict['Total Due After Discount'] = 0.0
+            table_dict['Total Due After Discount'] = after_discount
 
-            def change_word(docs, old_word, new_word, bold, size):
+            def change_word(docs, old_word, new_word, bold, size, page_break):
                 for paragraph in docs.paragraphs:
                     if f'%%{old_word}%%' in paragraph.text:
                         # print('ok')
@@ -275,15 +300,45 @@ def convert():
                                 run.font.size = Pt(size)  # Set font size to 18pt
                                 run.font.bold = bold  # Set text to bold
                                 run.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER  # Center align the text
+                        if page_break:
+                            paragraph.clear()
+                            run2 = paragraph.add_run()
+                            run2.add_break(docx.enum.text.WD_BREAK.PAGE)
+            doc_name = "modified_existing_document"
+            excel_name = "modified_existing_document"
+            if annu_month != "MONTHLY":
+                if money_type == 'DIRHAM':
+                    doc_name = f'Annual Word UAE - {company_name}'
+                    excel_name = f'Annual Excel UAE - {company_name}'
+                    doc = Document('documents/annual_dubai_word.docx')
+                else:
+                    doc_name = f'Annual Word USD - {company_name}'
+                    excel_name = f'Annual Excel USD - {company_name}'
+                    doc = Document('documents/annual_word.docx')
+            else:
+                total_after_fix = locale.format_string("%0.2f", total_of_dict, grouping=True)
+                if money_type == 'DIRHAM':
+                    doc_name = f'Monthly Word UAE - {company_name}'
+                    excel_name = f'Monthly Excel UAE - {company_name}'
+                    doc = Document('documents/monthly_dubai_word.docx')
+                    change_word(doc, 'total', str(total_after_fix), True, 11, False)
+                else:
+                    doc_name = f'Monthly Word USD - {company_name}'
+                    excel_name = f'Monthly Excel USD - {company_name}'
+                    doc = Document('documents/monthly_word.docx')
+                    change_word(doc, 'total', str(total_after_fix), True, 11, False)
 
-            if money_type == 'DIRHAM': doc = Document('documents/dubai_word.docx')
-            else: doc = Document('documents/word.docx')
-
-            change_word(doc, 'name', company_name, True, 18)
+            change_word(doc, 'name', company_name, True, 18, False)
 
             current_datetime = datetime.now()
             formatted_date = current_datetime.strftime('%d %B %Y')
-            change_word(doc, 'date', formatted_date, False, 18)
+            change_word(doc, 'date', formatted_date, False, 18, False)
+
+            ##page breaks
+            change_word(doc, 'page_break1', '', False, 11, True)
+            change_word(doc, 'page_break2', '', False, 11, True)
+            # change_word(doc, 'page_break3', '', False, 11, True)
+
 
             table = doc.tables[0]
             table.style = 'Table Grid'
@@ -299,8 +354,10 @@ def convert():
             # Add data to the table
             for product, price in table_dict.items():
                 row = table.add_row().cells
-                row[0].text = product
-                row[1].text = str(price)
+                row[0].text = product+f"\n{annu_month.lower()}"
+                formatted_price = locale.format_string("%0.2f", price, grouping=True)
+                row[1].text = formatted_price
+                row[1].paragraphs[0].alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT  # Align the Total section to the right
 
             last_two_rows_indices = range(len(table_dict) - 1, len(table_dict)+1)
             # Apply bold formatting to the last two rows' product names
@@ -312,9 +369,14 @@ def convert():
                                 if i in last_two_rows_indices:
                                     run.font.bold = True
 
-            # Save the modified document
-            doc.save(f'{output_folder}/modified_existing_document.docx')
-            print(f'Converting Excel to Docx and saving it to: {output_folder}')
+            # change excel file name
+            os.rename(f'{output_folder}/excel_output.xlsx', f'{output_folder}/{excel_name}.xlsx')
+            if generate_word_file.get():
+                # Save the modified document
+                doc.save(f'{output_folder}/{doc_name}.docx')
+                print(f'Saved excel and docs at: {output_folder}')
+            else: print(f'Saved excel at: {output_folder}')
+
         root.destroy()  # Close the window
 
 
@@ -337,8 +399,10 @@ def convert_json_to_docx():#select the json and move to screen2
     # ######
     display_selected_file()
 
+
 def display_selected_file():#screen 2
     global frame2  # Declare new_frame as a global variable
+    global generate_word_file
     frame.grid_forget()  # Remove the existing frame
     frame2 = ttk.Frame(root, padding=20)
     frame2.grid(row=0, column=0)
@@ -352,8 +416,11 @@ def display_selected_file():#screen 2
     change_excel_button = ttk.Button(frame2, text="Change Json File", command=change_selected_file)
     change_excel_button.grid(row=2, column=0, pady=(10, 10), padx=10, sticky='w')
 
-    change_excel_button = ttk.Button(frame2, text="Convert", command=convert)
-    change_excel_button.grid(row=3, column=0, pady=(10, 10), padx=10, sticky='w')
+    generate_word_checkbox = ttk.Checkbutton(frame2, text="Generate Word File", variable=generate_word_file)
+    generate_word_checkbox.grid(row=3, column=0, pady=(10, 10), padx=10, sticky='w')
+
+    convert_button = ttk.Button(frame2, text="Convert", command=convert)
+    convert_button.grid(row=4, column=0, pady=(10, 10), padx=10, sticky='w')
 
     # Center all widgets both vertically and horizontally
     frame2.grid_rowconfigure(1, weight=1)
@@ -372,7 +439,10 @@ def toggle_currency():
     global money_type
     if money_type == "DOLLAR": money_type = "DIRHAM"; toggle_currency_button.configure(image=off_icon)
     else: money_type = "DOLLAR"; toggle_currency_button.configure(image=on_icon)
-
+# def toggle_period():
+#     current_period = period_var.get()
+#     if current_period == "Annual": period_var.set("Monthly")
+#     else: period_var.set("Annual")
 
 
 root = tk.Tk()
@@ -386,6 +456,8 @@ on_icon = ImageTk.PhotoImage(on_image)
 off_image = Image.open("images/Flag-United-Arab-Emirates.png")
 off_image = off_image.resize((45, 30))
 off_icon = ImageTk.PhotoImage(off_image)
+
+generate_word_file = tk.BooleanVar(value=False)
 
 # Get the screen width and height
 screen_width = root.winfo_screenwidth()
@@ -421,6 +493,14 @@ excel_file_label.grid(row=2, column=0, pady=(10, 10), padx=10, sticky='w')
 currency_var = tk.BooleanVar(value=True)  # True for DOLLAR, False for DIRHAM
 toggle_currency_button = ttk.Checkbutton(frame, image=on_icon, variable=currency_var, command=toggle_currency,style="TButton", onvalue=True, offvalue=False)
 toggle_currency_button.grid(row=3, column=0, pady=(0, 10), padx=10, sticky='w')
+
+# Create a StringVar for the annual/monthly toggle button
+# period_var = tk.StringVar(value="Annual")  # "Annual" as default
+
+# Create a button to toggle between Annual and Monthly
+# toggle_period_button = ttk.Button(frame, textvariable=period_var, command=toggle_period, style="TButton")
+# toggle_period_button.grid(row=4, column=0, pady=(0, 10), padx=10, sticky='w')
+
 
 # Center all widgets both vertically and horizontally
 frame.grid_rowconfigure(1, weight=1)
